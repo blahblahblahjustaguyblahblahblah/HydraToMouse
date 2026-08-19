@@ -7,6 +7,6 @@ Q for toggling telekinesis
 Whats currently done:  
 - [x] Telekinesis
 
-- [ ] Telekinesis for portals
+- [ ] Portal surfing
 
 - [ ] Cube scaling
