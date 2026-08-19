@@ -62,6 +62,38 @@ static std::atomic<bool> g_enterKeyDown{ false };      // Enter зажат пр�
 static std::atomic<bool> g_pendingDisable{ false };    // Q нажали на выключение — ждём, пока доиграет импульс SIXENSE_BUTTON_1
 
 // ------------------------------------------------------------------
+// Фокус окна игры. Хуки WH_KEYBOARD_LL/WH_MOUSE_LL глобальные и видят
+// ВСЕ клавиши/мышь в системе, даже когда игра свёрнута/не в фокусе.
+// Поэтому явно проверяем, что foreground-окно принадлежит нашему же
+// процессу (игре), и не обрабатываем ввод, если это не так.
+// ------------------------------------------------------------------
+static std::atomic<bool> g_gameFocused{ true };
+static std::atomic<bool> g_cursorHiddenByUs{ false }; // чтобы не разбалансировать счётчик ShowCursor
+
+static bool IsGameWindowForeground()
+{
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(fg, &fgPid);
+    return fgPid == GetCurrentProcessId();
+}
+
+// Прячем курсор, только если окно игры реально в фокусе прямо сейчас.
+static void HideCursorIfFocused()
+{
+    if (g_gameFocused.load() && !g_cursorHiddenByUs.exchange(true))
+        ShowCursor(FALSE);
+}
+
+// Возвращаем курсор — безопасно вызывать в любой момент, даже если он уже виден.
+static void RestoreCursor()
+{
+    if (g_cursorHiddenByUs.exchange(false))
+        ShowCursor(TRUE);
+}
+
+// ------------------------------------------------------------------
 // Диагностическое логирование в консоль. Печатаем только первые
 // LOG_WINDOW_MS миллисекунд после каждого включения Q — чтобы поймать
 // момент, когда начинается самопроизвольная ходьба/телекинез.
@@ -85,19 +117,19 @@ static bool InLogWindow()
 
 // Позиция/поворот виртуального контроллера (индекс 0 — "активная рука")
 static std::mutex g_input_mutex;
-static float g_pos[3]      = { 0.0f, 0.0f, 0.0f };   // мм, локальные смещения от нейтральной точки
-static float g_yaw         = 0.0f;                    // вращение колесом (радианы) — используется как "roll" реального контроллера
-static float g_trigger     = 0.0f;                    // 0..1, ЛКМ = grab/drag
+static float g_pos[3] = { 0.0f, 0.0f, 0.0f };   // мм, локальные смещения от нейтральной точки
+static float g_yaw = 0.0f;                    // вращение колесом (радианы) — используется как "roll" реального контроллера
+static float g_trigger = 0.0f;                    // 0..1, ЛКМ = grab/drag
 static unsigned int g_buttons = 0;
-static float g_moveX       = 0.0f;                    // -1..1, A/D — стик контроллера (стрейф)
-static float g_moveY       = 0.0f;                    // -1..1, W/S — стик контроллера (вперёд/назад)
+static float g_moveX = 0.0f;                    // -1..1, A/D — стик контроллера (стрейф)
+static float g_moveY = 0.0f;                    // -1..1, W/S — стик контроллера (вперёд/назад)
 static bool g_keyW = false, g_keyA = false, g_keyS = false, g_keyD = false;
 
 // Настройки чувствительности — подгоняются опытным путём
-static const float kMouseToMm   = 1.2f;   // пикселей -> мм смещения по X/Y
-static const float kWheelToMm   = 15.0f;  // один "щелчок" колеса -> мм по Z (push/pull)
-static const float kWheelToRad  = 0.12f;  // один "щелчок" колеса -> радианы поворота (если зажат Shift)
-static const float kPosLimit    = 250.0f; // ограничение смещения по каждой оси, мм
+static const float kMouseToMm = 1.2f;   // пикселей -> мм смещения по X/Y
+static const float kWheelToMm = 15.0f;  // один "щелчок" колеса -> мм по Z (push/pull)
+static const float kWheelToRad = 0.12f;  // один "щелчок" колеса -> радианы поворота (если зажат Shift)
+static const float kPosLimit = 250.0f; // ограничение смещения по каждой оси, мм
 
 // ------------------------------------------------------------------
 // Низкоуровневый хук мыши/клавиатуры
@@ -107,9 +139,14 @@ static HHOOK g_keyboardHook = nullptr;
 
 static void SimulateEKey()
 {
-    // Небольшая задержка нужна некоторым играм:
-    // они игнорируют искусственный E прямо в момент закрытия режима.
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    // Раньше тут была задержка 30мс перед отправкой — специально для игр,
+    // которые игнорируют искусственный E ровно в момент закрытия режима.
+    // Но за эти 30мс sixenseThreadFunc успевал отдать игре уже обнулённую
+    // позицию контроллера (резкий скачок в 0,0,0 за один кадр), и физика
+    // трактовала это как бросок/толчок предмета — куб получал импульс
+    // раньше, чем E успевал долететь и "отпустить" его штатно. Теперь
+    // отправляем E без задержки и ДО сброса позиции (см. вызов ниже),
+    // чтобы E пришёл в игру первым, а не после толчка.
 
     INPUT input[2] = {};
 
@@ -136,7 +173,7 @@ static void ClampPos()
 
 static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if (nCode == HC_ACTION && g_emulationActive.load())
+    if (nCode == HC_ACTION && g_emulationActive.load() && g_gameFocused.load())
     {
         MSLLHOOKSTRUCT* info = (MSLLHOOKSTRUCT*)lParam;
 
@@ -196,6 +233,14 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 {
     static bool qHeld = false; // общий для KEYDOWN/KEYUP, а не локальный в одном блоке
 
+    if (nCode == HC_ACTION && !g_gameFocused.load())
+    {
+        // Окно игры не в фокусе (свёрнуто/alt-tab/пишем в другом окне) —
+        // вообще не детектим наши биндинги (Q/E/WASD/Space/Ctrl/Enter),
+        // чтобы они не перехватывались, пока человек печатает где-то ещё.
+        return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+    }
+
     if (nCode == HC_ACTION)
     {
         KBDLLHOOKSTRUCT* info = (KBDLLHOOKSTRUCT*)lParam;
@@ -221,7 +266,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         g_buttons = 0;
                         g_trigger = 0.0f;
                     }
-                    ShowCursor(FALSE);
+                    HideCursorIfFocused();
                 }
                 else if (!g_pendingDisable.load())
                 {
@@ -257,8 +302,14 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 printf("[HydraMouse] E pressed during Q: disabling Q and replaying E\n");
                 fflush(stdout);
 
+                // Гасим режим и сразу шлём E — до сброса позиции/состояния,
+                // чтобы игра получила E раньше, чем зафиксирует скачок
+                // позиции контроллера в (0,0,0), который она может
+                // истолковать как бросок предмета.
                 g_emulationActive.store(false);
                 g_pendingDisable.store(false);
+
+                SimulateEKey();
 
                 {
                     std::lock_guard<std::mutex> lk(g_input_mutex);
@@ -269,9 +320,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     g_trigger = 0.0f;
                 }
 
-                ShowCursor(TRUE);
-
-                SimulateEKey();
+                RestoreCursor();
 
                 return 1;
             }
@@ -293,7 +342,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         if (!(info->flags & LLKHF_INJECTED))
         {
             bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-            bool isUp   = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+            bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
             if (isDown || isUp)
             {
                 bool handled = true;
@@ -357,7 +406,8 @@ static LRESULT CALLBACK RawInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 RAWINPUT* raw = (RAWINPUT*)buffer;
                 if (raw->header.dwType == RIM_TYPEMOUSE &&
                     !(raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
-                    g_emulationActive.load())
+                    g_emulationActive.load() &&
+                    g_gameFocused.load())
                 {
                     LONG dx = raw->data.mouse.lLastX;
                     LONG dy = raw->data.mouse.lLastY;
@@ -388,7 +438,7 @@ static bool InitRawInput(HINSTANCE hInst)
     RegisterClassExW(&wc); // если уже зарегистрирован — не страшно, просто игнорируем ошибку
 
     g_rawInputWnd = CreateWindowExW(0, kClassName, L"", 0, 0, 0, 0, 0,
-                                     HWND_MESSAGE, nullptr, hInst, nullptr);
+        HWND_MESSAGE, nullptr, hInst, nullptr);
     if (!g_rawInputWnd)
         return false;
 
@@ -411,6 +461,24 @@ static void HookThreadFunc()
     MSG msg;
     while (g_running.load())
     {
+        // Следим за фокусом окна игры. Проверяем каждую итерацию цикла
+        // (интервал ~2мс, см. sleep ниже), чтобы реакция была мгновенной:
+        // - потеряли фокус (alt-tab/свернули игру, кликнули в другое окно) —
+        //   сразу возвращаем курсор, даже если Q/motion-режим всё ещё "включён"
+        //   внутри игры. Раньше курсор мог остаться заблокированным навсегда
+        //   после сворачивания игры, пока был активен Q.
+        // - вернули фокус на игру — если Q всё ещё включён, снова прячем
+        //   курсор (как будто ничего и не происходило).
+        bool focusedNow = IsGameWindowForeground();
+        bool wasFocused = g_gameFocused.exchange(focusedNow);
+        if (focusedNow != wasFocused)
+        {
+            if (!focusedNow)
+                RestoreCursor();
+            else if (g_emulationActive.load())
+                HideCursorIfFocused();
+        }
+
         if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
         {
             TranslateMessage(&msg);
@@ -469,7 +537,7 @@ static void sixenseThreadFunc()
     bool enterSeqActive = false;
     unsigned long enterSeqFrame = 0;
     static const unsigned long ENTER_CALIB_FRAMES = 60; // ~1с анлок + держим триггер калибровки
-    static const unsigned long ENTER_HOLD_FRAMES  = 20; // ~0.3с держим анлок, пока Start долетает до игры
+    static const unsigned long ENTER_HOLD_FRAMES = 20; // ~0.3с держим анлок, пока Start долетает до игры
     static const unsigned long ENTER_TOTAL_FRAMES = ENTER_CALIB_FRAMES + ENTER_HOLD_FRAMES;
 
     // --- Отложенное выключение Q: сначала полностью доигрываем импульс
@@ -640,7 +708,7 @@ static void sixenseThreadFunc()
         }
         if (disablingInProgress)
         {
-           // buttons |= SIXENSE_BUTTON_1;
+            // buttons |= SIXENSE_BUTTON_1;
             disableFrame++;
             if (disableFrame >= RELEASE_PULSE_FRAMES)
             {
