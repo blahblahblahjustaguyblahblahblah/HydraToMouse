@@ -1,4 +1,4 @@
-Download portal 2 in motion from here:  
+Download portal 2 motion pack from here:  
 https://www.moddb.com/games/portal-2/downloads/portal-2-sixense-motionpack-post-february-2021-setup
   
 Controls:  
